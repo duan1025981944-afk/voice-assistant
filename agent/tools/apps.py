@@ -1,6 +1,15 @@
 """软件相关的三个工具：open_app / switch_to_app / close_app。
 
 ──────────────────────────────────────────────────────────────
+"关掉豆包"是怎么找到豆包的
+──────────────────────────────────────────────────────────────
+按**程序**找，不按单个窗口找。同一个程序的窗口归成一组（RunningApp），
+这一组的名字来自三处：进程名（Doubao）、程序文件里写的产品名（微信）、主窗口标题。
+窗口分两种：看得见的主窗口，和点了 × 后收进托盘、藏起来的主窗口。
+只看"看得见、有标题"的窗口会把收进托盘的软件误判成"没开"——豆包就是这样：
+主窗口藏着，看得见的只有一个没标题的悬浮球。
+
+──────────────────────────────────────────────────────────────
 "打开微信"是怎么找到微信的
 ──────────────────────────────────────────────────────────────
 1. 应用清单来自 PowerShell 的 Get-StartApps：开始菜单里能看到的软件都在
@@ -15,6 +24,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
@@ -22,6 +32,7 @@ import subprocess
 import time
 from dataclasses import dataclass
 
+import psutil
 from pypinyin import lazy_pinyin
 from rapidfuzz import fuzz
 
@@ -193,19 +204,125 @@ def find_app(name: str) -> tuple[App | None, list[App]]:
     return None, []
 
 
-def find_windows(name: str) -> tuple[list[_win32.Window], list[str]]:
-    """找打开着的窗口：返回 (最像的那个程序的所有窗口, 候选描述)。"""
-    name = resolve_alias(name)
-    windows = [w for w in _win32.list_windows() if w.title != "Program Manager"]
-    items = [
-        (w, keys_for(w.title) + keys_for(w.process.removesuffix(".exe")))
-        for w in windows
-    ]
-    best, candidates = pick(rank(name, items))
-    if best is None:
-        return [], [f"{w.title}（{w.process}）" for w in candidates]
-    same_process = [w for w in windows if w.process == best.process and best.process]
-    return same_process or [best], []
+# 不当成"软件"的进程：任务栏和开始菜单的零件、输入法、我们自己
+IGNORED_PROCESSES = {"textinputhost.exe", "shellexperiencehost.exe", "searchhost.exe",
+                     "startmenuexperiencehost.exe", "dwm.exe", "python.exe", "pythonw.exe"}
+IGNORED_TITLES = {"Program Manager"}
+# 这个进程替所有商店应用托管窗口（计算器、设置……），只能按窗口一个个算
+UWP_HOST = "applicationframehost.exe"
+
+
+@dataclass
+class RunningApp:
+    label: str                      # 给人看的名字
+    windows: list[_win32.Window]
+
+    @property
+    def shown(self) -> list[_win32.Window]:
+        return [w for w in self.windows if w.shown]
+
+    @property
+    def tucked(self) -> list[_win32.Window]:
+        return [w for w in self.windows if w.tucked]
+
+    @property
+    def process(self) -> str:
+        return self.windows[0].process
+
+    def keys(self) -> list[str]:
+        w = self.windows[0]
+        texts = {w.process.removesuffix(".exe"), _win32.file_description(w.exe), self.label}
+        texts |= {x.title for x in self.windows if x.main and x.title}
+        texts |= set(start_menu_names(w.exe, w.process))
+        return [k for t in texts if t for k in keys_for(t)]
+
+
+def _package_family(exe: str) -> str:
+    r"""商店应用的包名：WindowsApps\Microsoft.WindowsNotepad_11.2607.14.0_x64__8wekyb3d8bbwe\…
+    → Microsoft.WindowsNotepad_8wekyb3d8bbwe（开始菜单里的 AppID 就以它开头）。
+
+    >>> _package_family(r"C:\Program Files\WindowsApps\Microsoft.WindowsNotepad_11.2607.14.0_x64__8wekyb3d8bbwe\Notepad\Notepad.exe")
+    'Microsoft.WindowsNotepad_8wekyb3d8bbwe'
+    >>> _package_family(r"C:\Program Files\Tencent\Weixin\Weixin.exe")
+    ''
+    """
+    m = re.search(r"\\WindowsApps\\([^\\_]+)_[^\\_]+_[^\\_]*_[^\\_]*_([^\\_]+)\\", exe)
+    return f"{m.group(1)}_{m.group(2)}" if m else ""
+
+
+def start_menu_names(exe: str, process: str) -> list[str]:
+    """这个程序在开始菜单里叫什么，"打开"和"关闭"用同一套名字才不会对不上。
+
+    三种对法（AppID 来自 Get-StartApps）：
+        商店应用    AppID 以包名开头：Microsoft.WindowsNotepad_8wekyb3d8bbwe!App → 记事本
+        普通程序    AppID 是 exe 路径：…\\Tencent\\Weixin\\Weixin.exe → 微信
+        自定义 ID   AppID 第一段和进程名相同：Doubao.ChatApp ↔ Doubao.exe → 豆包
+    """
+    family = _package_family(exe).lower()
+    stem = process.lower().removesuffix(".exe")
+    names = []
+    for app in installed_apps():
+        app_id = app.target.removeprefix("shell:AppsFolder\\").lower()
+        if app_id == app.target.lower():
+            continue                              # 内置的系统程序，没有 AppID
+        if (family and app_id.startswith(family + "!")) \
+                or (process and app_id.endswith("\\" + process.lower())) \
+                or (stem and "\\" not in app_id and "!" not in app_id and app_id.split(".")[0] == stem):
+            names.append(app.name)
+    return names
+
+
+def running_apps(windows: list[_win32.Window] | None = None) -> list[RunningApp]:
+    """把所有窗口按程序归组。"""
+    windows = _win32.list_windows() if windows is None else windows
+    groups: dict[str, list[_win32.Window]] = {}
+    for w in windows:
+        proc = w.process.lower()
+        if not proc or proc in IGNORED_PROCESSES or w.title in IGNORED_TITLES:
+            continue
+        key = f"{proc}|{w.hwnd}" if proc == UWP_HOST else proc
+        groups.setdefault(key, []).append(w)
+
+    return [RunningApp(label=_label(ws), windows=ws) for ws in groups.values()]
+
+
+def _label(windows: list[_win32.Window]) -> str:
+    """念给用户听的名字。优先级：
+    1. 程序文件里写的中文产品名（"Windows 资源管理器"）——最稳，不随窗口内容变
+    2. 开始菜单里的名字（"记事本""微信"）——和"打开"时用的名字一致
+    3. 短的主窗口标题（"豆包"）
+    4. 英文产品名、长标题、进程名
+    """
+    first = windows[0]
+    description = _win32.file_description(first.exe)
+    if re.search(r"[一-鿿]", description):
+        return description
+    menu = start_menu_names(first.exe, first.process)
+    if menu:
+        return menu[0]
+    titles = [w.title for w in windows if w.shown and w.title] + [w.title for w in windows if w.tucked]
+    short = next((t for t in titles if len(t) <= 8), "")
+    return short or description or (titles[0] if titles else "") or first.process.removesuffix(".exe")
+
+
+def find_running(name: str, apps: list[RunningApp] | None = None) -> tuple[RunningApp | None, list[RunningApp]]:
+    """按名字找正在运行的程序：(确定的那个, 候选)。
+
+    原话和别名各比一次取高分：别名是给"打开"用的（"资源管理器"→开始菜单里的"文件资源管理器"），
+    正在运行的程序不一定叫那个名字（资源管理器进程写的是"Windows 资源管理器"）。
+    """
+    apps = running_apps() if apps is None else apps
+    items = [(a, a.keys()) for a in apps]
+    best: dict[int, tuple[RunningApp, float]] = {}
+    for query in {name, resolve_alias(name)}:
+        for app, s in rank(query, items):
+            if id(app) not in best or s > best[id(app)][1]:
+                best[id(app)] = (app, s)
+    return pick(sorted(best.values(), key=lambda pair: pair[1], reverse=True))
+
+
+def _process_alive(process: str) -> bool:
+    return any(p.info["name"] == process for p in psutil.process_iter(["name"]))
 
 
 # ── 工具 ──────────────────────────────────────────────────
@@ -257,21 +374,26 @@ class SwitchToAppTool(Tool):
     needs_confirm = False
 
     async def execute(self, name: str) -> str:
-        windows, candidates = find_windows(name)
-        if not windows:
-            hint = f"差不多的有：{'、'.join(candidates)}" if candidates else "可以用 open_app 打开它"
-            return ToolResult.error(f"没有找到开着的「{name}」窗口。{hint}")
-        target = windows[0]
-        if not _win32.bring_to_front(target.hwnd):
-            return ToolResult.error(f"Windows 不让切换到「{target.title}」，可能是它以管理员身份运行")
-        return f"已切换到 {target.title}"
+        app, candidates = find_running(name)
+        if app is None:
+            hint = f"差不多的有：{'、'.join(c.label for c in candidates)}" if candidates else "可以用 open_app 打开它"
+            return ToolResult.error(f"「{name}」没有在运行。{hint}")
+        if app.shown:
+            ok = _win32.bring_to_front(app.shown[0].hwnd)
+        elif app.tucked:
+            ok = _win32.show_window(app.tucked[0].hwnd)    # 收进托盘了：把主窗口重新显示出来
+        else:
+            return ToolResult.error(f"{app.label}在后台运行，但没有能显示的窗口，改用 open_app 试试")
+        if not ok:
+            return ToolResult.error(f"Windows 不让切换到{app.label}，可能是它以管理员身份运行")
+        return f"已切换到 {app.label}"
 
 
 class CloseAppTool(Tool):
     name = "close_app"
     description = (
         "关闭一个软件的所有窗口，效果等于点窗口右上角的 ×（软件有没保存的内容会自己弹窗问）。"
-        "不会强制结束进程。"
+        "不会强制结束进程：有些软件关掉窗口后还在托盘里运行，工具会如实返回，照实告诉用户。"
     )
     parameters = {
         "type": "object",
@@ -280,17 +402,26 @@ class CloseAppTool(Tool):
         },
         "required": ["name"],
     }
-    needs_confirm = True
+    def requires_confirm(self, args: dict) -> bool:
+        # 只有真有窗口要关时才问；没在运行、或者只在托盘里，什么都不会发生，不用问
+        app, _ = find_running(args.get("name", ""))
+        return app is not None and bool(app.shown)
 
     def confirm_prompt(self, args: dict) -> str:
         return f"确定要关闭{args.get('name', '这个软件')}吗？"
 
     async def execute(self, name: str) -> str:
-        windows, candidates = find_windows(name)
-        if not windows:
-            hint = f"差不多的有：{'、'.join(candidates)}" if candidates else ""
-            return ToolResult.error(f"没有找到开着的「{name}」窗口。{hint}")
-        failures = [err for w in windows if (err := _win32.close_window(w.hwnd))]
+        app, candidates = find_running(name)
+        if app is None:
+            hint = f"差不多的有：{'、'.join(c.label for c in candidates)}。" if candidates else ""
+            return f"「{name}」没有在运行，不用关。{hint}"
+        if not app.shown:
+            return (f"{app.label}没有打开的窗口，它在后台运行（托盘图标或悬浮窗）。"
+                    "关窗口我能做，让它完全退出我做不到：要退出得在它的托盘图标上右键选退出。")
+        failures = [err for w in app.shown if (err := _win32.close_window(w.hwnd))]
         if failures:
             return ToolResult.error(failures[0])
-        return f"已关闭 {windows[0].process.removesuffix('.exe') or windows[0].title}（{len(windows)} 个窗口）"
+        await asyncio.sleep(1.0)                   # 给它一点时间退出，再看进程还在不在
+        if _process_alive(app.process):
+            return f"已关闭{app.label}的窗口，不过它还在后台运行（比如托盘里），要完全退出得在托盘图标上选退出"
+        return f"已关闭{app.label}"

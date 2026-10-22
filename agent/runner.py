@@ -20,6 +20,7 @@
 """
 from __future__ import annotations
 
+import logging
 import time
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
@@ -27,11 +28,18 @@ from typing import Any, Awaitable, Callable
 from agent.tools.base import Tool, ToolResult
 from providers.base import Provider, ToolCall
 
+log = logging.getLogger("agent")
+
 # 收 (工具, 参数)，返回用户同不同意
 ConfirmFn = Callable[[Tool, dict], Awaitable[bool]]
 
 TOOL_ERROR_HINT = "（检查参数是否正确，或换一种方式完成。不要用同样的参数重试。）"
-DECLINED = "用户没有同意，操作已取消。不要再试，简短告诉用户已经取消了。"
+# 写清楚"没有弹窗"：模型曾经据此编出"屏幕上有个确认框没人点"
+DECLINED = (
+    "用户在语音确认时没有同意（说了取消，或者没听清），所以没有执行。"
+    "屏幕上没有任何确认框，不要让用户去点什么。"
+    "用一句话告诉用户没有执行；想做的话可以再说一次，听到提问和提示音后回答“确认”。"
+)
 
 # 只保留最近这么多条消息（之前的从一条 user 消息处整段切掉）
 MAX_MESSAGES = 40
@@ -92,6 +100,8 @@ class VoiceRunner:
                 for call in reply.tool_calls:
                     result.tools_called.append(call.name)
                     output = await self._execute(call)
+                    # 工具返回了什么要记下来：模型转述时可能说偏，排查时得看原话
+                    log.info("工具 %s %s → %s", call.name, call.arguments, str(output)[:200])
                     self.messages.append(
                         {"role": "tool", "tool_call_id": call.id, "content": str(output)}
                     )

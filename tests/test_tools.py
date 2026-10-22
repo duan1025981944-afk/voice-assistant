@@ -109,3 +109,68 @@ def test_volume_roundtrip():
         volume.set_volume(original)
         volume.set_mute(muted)
     assert volume.get_volume() == (original, muted)
+
+
+# ── 正在运行的程序：用假窗口测"按程序找"、托盘里的软件、关闭前要不要问 ──
+
+from agent.tools._win32 import Window  # noqa: E402
+
+FAKE_MENU = [
+    apps.App("豆包", r"shell:AppsFolder\Doubao.ChatApp"),
+    apps.App("记事本", r"shell:AppsFolder\Microsoft.WindowsNotepad_8wekyb3d8bbwe!App"),
+    apps.App("微信", r"shell:AppsFolder\{6D809377-6AF0-444B-8957-A3773F02200E}\Tencent\Weixin\Weixin.exe"),
+]
+NOTEPAD_EXE = r"C:\Program Files\WindowsApps\Microsoft.WindowsNotepad_11.2607.14.0_x64__8wekyb3d8bbwe\Notepad\Notepad.exe"
+FAKE_WINDOWS = [
+    # 豆包：主窗口收进了托盘，看得见的只有没标题的悬浮球
+    Window(1, "豆包", 10, "Doubao.exe", r"C:\x\Doubao.exe", visible=False, main=True),
+    Window(2, "", 10, "Doubao.exe", r"C:\x\Doubao.exe", visible=True, main=False),
+    # 英文界面的记事本：标题里没有"记事本"三个字
+    Window(3, "assistant.log - Notepad", 20, "Notepad.exe", NOTEPAD_EXE, visible=True, main=True),
+    Window(4, "微信", 30, "Weixin.exe", r"C:\Program Files\Tencent\Weixin\Weixin.exe", visible=True, main=True),
+]
+
+
+@pytest.fixture
+def fake_running(monkeypatch):
+    monkeypatch.setattr(apps, "installed_apps", lambda refresh=False: FAKE_MENU)
+    monkeypatch.setattr(apps._win32, "list_windows", lambda: FAKE_WINDOWS)
+    monkeypatch.setattr(apps._win32, "file_description", lambda exe: "")
+
+
+@pytest.mark.parametrize("said, label, shown, tucked", [
+    ("豆包", "豆包", 0, 1),
+    ("记事本", "记事本", 1, 0),          # 靠开始菜单的名字对上英文界面的记事本
+    ("微信", "微信", 1, 0),
+])
+def test_find_running(fake_running, said, label, shown, tucked):
+    app, _ = apps.find_running(said)
+    assert app is not None and app.label == label
+    assert (len(app.shown), len(app.tucked)) == (shown, tucked)
+
+
+def test_close_tray_app_does_not_ask_and_says_why(fake_running, monkeypatch):
+    closed = []
+    monkeypatch.setattr(apps._win32, "close_window", lambda hwnd: closed.append(hwnd))
+    tool = apps.CloseAppTool()
+    assert not tool.requires_confirm({"name": "豆包"})
+    out = run(tool.execute("豆包"))
+    assert "后台运行" in out and not closed
+
+
+def test_close_not_running(fake_running):
+    tool = apps.CloseAppTool()
+    assert not tool.requires_confirm({"name": "网易云音乐"})
+    assert "没有在运行" in run(tool.execute("网易云音乐"))
+
+
+def test_close_open_app_asks_and_closes(fake_running, monkeypatch):
+    closed = []
+    monkeypatch.setattr(apps._win32, "close_window", lambda hwnd: closed.append(hwnd))
+    monkeypatch.setattr(apps, "_process_alive", lambda process: False)
+    real_sleep = asyncio.sleep                      # 先存下来：patch 的是全局的 asyncio.sleep
+    monkeypatch.setattr(apps.asyncio, "sleep", lambda s: real_sleep(0))
+    tool = apps.CloseAppTool()
+    assert tool.requires_confirm({"name": "记事本"})
+    assert run(tool.execute("记事本")) == "已关闭记事本"
+    assert closed == [3]

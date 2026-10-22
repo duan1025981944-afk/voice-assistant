@@ -13,8 +13,8 @@
     "defaults": { "modelPreset": "ds", "maxIterations": 6 }
   },
   "voice": {
-    "assistantName": "小智",
-    "wakeWords": ["你好小智","小智小智"],
+    "assistantName": "大肥鱼",
+    "wakeWords": ["大肥鱼"],
     "hotkey": "win+alt+space",
     "inputDevice": null,
     "ttsVoice": "zh-CN-XiaoxiaoNeural",

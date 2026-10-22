@@ -48,8 +48,10 @@ from voice.wake import WakeWordDetector
 
 log = logging.getLogger("assistant")
 
-YES = ("确认", "确定", "是的", "是", "对", "好的", "好", "可以", "行", "执行", "没问题", "嗯")
-NO = ("不", "别", "取消", "算了", "停", "等等")
+# 确认时的回答怎么算。会问确认的只有"关软件 / 关机 / 重启"，所以"关""重启"本身就算同意。
+YES = ("确认", "确定", "同意", "是", "对", "好", "行", "可以", "嗯", "没问题", "没错", "当然",
+       "执行", "要", "关", "重启", "yes", "yeah", "ok", "sure")
+NO = ("不", "别", "取消", "算了", "停", "等等", "no")
 
 
 class State(enum.Enum):
@@ -60,17 +62,26 @@ class State(enum.Enum):
     PAUSED = "已暂停"
 
 
-def is_yes(answer: str | None) -> bool:
-    """先看否定词（"不确定"里也有"确定"），再看肯定词。
+def classify_answer(answer: str | None) -> bool | None:
+    """True 同意 / False 不同意 / None 没听清（没说话，或者听不出是哪个意思）。
 
-    >>> [is_yes(a) for a in ["确认", "好的关吧", "不确定", "取消", "", None]]
-    [True, True, False, False, False, False]
+    先看否定词（"不确定""不要关"里也有肯定的字），再看肯定词。
+
+    >>> [classify_answer(a) for a in ["确认", "关闭吧", "关掉", "YES", "对对对", "好的关吧"]]
+    [True, True, True, True, True, True]
+    >>> [classify_answer(a) for a in ["不确定", "不要关", "取消", "算了吧", "No."]]
+    [False, False, False, False, False]
+    >>> [classify_answer(a) for a in ["啊？", "什么", "", None]]
+    [None, None, None, None]
     """
     if not answer:
+        return None
+    text = answer.lower()
+    if any(w in text for w in NO):
         return False
-    if any(w in answer for w in NO):
-        return False
-    return any(w in answer for w in YES)
+    if any(w in text for w in YES):
+        return True
+    return None
 
 
 def _resolve(future: concurrent.futures.Future, value) -> None:
@@ -299,25 +310,40 @@ class Assistant:
         return await asyncio.to_thread(self.speaker.say, text)
 
     async def _confirm(self, tool: Tool, args: dict) -> bool:
-        """runner 在执行危险操作前调这里：念一句"确定要……吗"，再听一句回答。"""
+        """runner 在执行危险操作前调这里：念一句"确定要……吗"，叮一声，再听一句回答。
+
+        没听清（没说话、或听不出同不同意）就再问一次；第二次还不清楚，当作不同意。
+        """
         gen = self._gen
-        if not await self._say(tool.confirm_prompt(args), gen) or gen != self._gen:
-            return False                         # 问到一半被打断了，当作不同意
+        question = tool.confirm_prompt(args)
+        verdict = None
+        for attempt in range(2):
+            prompt = question if attempt == 0 else f"没听清。{question}请说确认或者取消。"
+            if not await self._say(prompt, gen) or gen != self._gen:
+                return False                     # 问到一半被打断了，当作不同意
+            answer = await self._hear_answer(gen)
+            verdict = classify_answer(answer)
+            log.info("确认 %s：%s → %s", tool.name, answer,
+                     {True: "同意", False: "不同意", None: "没听清"}[verdict])
+            if verdict is not None or gen != self._gen:
+                break
+        self._set_state(State.THINKING, gen)
+        return bool(verdict) and gen == self._gen
+
+    async def _hear_answer(self, gen: int) -> str | None:
+        """叮一声提示"该你说了"，然后收一句话。超时或被新的一轮打断返回 None。"""
         future: concurrent.futures.Future = concurrent.futures.Future()
         with self._lock:
             if gen != self._gen:
-                return False
+                return None
             self._answer = future
+            chime("wake")
             self._begin_listening("确认", new_turn=False, timeout=self.settings.confirm_timeout)
         try:
-            answer = await asyncio.wait_for(asyncio.wrap_future(future), self.settings.confirm_timeout + 15)
+            return await asyncio.wait_for(asyncio.wrap_future(future), self.settings.confirm_timeout + 15)
         except asyncio.TimeoutError:
-            answer = None
+            return None
         finally:
             with self._lock:
                 if self._answer is future:
                     self._answer = None
-        agreed = is_yes(answer)
-        log.info("确认 %s：%s → %s", tool.name, answer, "同意" if agreed else "不同意")
-        self._set_state(State.THINKING, gen)
-        return agreed

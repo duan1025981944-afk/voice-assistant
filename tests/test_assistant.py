@@ -1,6 +1,7 @@
 """整个状态机的端到端测试：合成语音当麦克风，假喇叭、假模型，不出声、不联网、不真关机。
 
-覆盖：唤醒 → 识别 → 思考 → 回复；关机前的语音确认（说"取消" / 说"确认"）。
+覆盖：唤醒 → 识别 → 思考 → 回复；关机前的语音确认（说"取消" / 说"确认" / 说"关掉吧" /
+没听清再问一次）。每轮的记录写进临时目录，不混进 data/events/ 里真实的使用记录。
 """
 import queue
 import threading
@@ -64,11 +65,13 @@ def voice_clips():
         "shutdown": np.concatenate([clip("帮我关机"), silence(1.5)]),
         "cancel": np.concatenate([silence(0.3), clip("取消"), silence(1.5)]),
         "confirm": np.concatenate([silence(0.3), clip("确认"), silence(1.5)]),
+        "close_it": np.concatenate([silence(0.3), clip("关掉吧"), silence(1.5)]),
+        "unclear": np.concatenate([silence(0.3), clip("今天星期几"), silence(1.5)]),
     }
 
 
 @pytest.fixture
-def assistant(monkeypatch):
+def assistant(monkeypatch, tmp_path):
     import assistant as assistant_mod
     from config.schema import VoiceSettings
     from tests.test_runner import ScriptedProvider
@@ -76,6 +79,7 @@ def assistant(monkeypatch):
     monkeypatch.setattr(assistant_mod, "chime", lambda kind="wake": None)
     a = assistant_mod.Assistant(VoiceSettings())
     a.mic, a.speaker = FakeMic(), FakeSpeaker()
+    a.events.dir = tmp_path
     a.runner.provider = ScriptedProvider([])
     a._brain.start()
     a._ears.start()
@@ -107,7 +111,7 @@ def test_wake_then_answer(assistant, voice_clips):
     assert wait_for(lambda: assistant.state is State.IDLE)
 
 
-@pytest.mark.parametrize("answer, executed", [("cancel", False), ("confirm", True)])
+@pytest.mark.parametrize("answer, executed", [("cancel", False), ("confirm", True), ("close_it", True)])
 def test_shutdown_needs_voice_confirm(assistant, voice_clips, monkeypatch, answer, executed):
     from agent.tools import power
     from assistant import State
@@ -126,3 +130,25 @@ def test_shutdown_needs_voice_confirm(assistant, voice_clips, monkeypatch, answe
     assert wait_for(lambda: len(assistant.speaker.said) == 2)
     assert bool(sent) is executed
     assert wait_for(lambda: assistant.state is State.IDLE)
+
+
+def test_unclear_answer_asks_again(assistant, voice_clips, monkeypatch):
+    from agent.tools import power
+    from assistant import State
+    from tests.test_runner import text_reply, tool_reply
+    sent = []
+    monkeypatch.setattr(power, "_run", lambda args: sent.append(args) or 0)
+    assistant.runner.provider.replies += [tool_reply("power", {"action": "shutdown"}), text_reply("好的")]
+
+    assistant.mic.push(voice_clips["wake"])
+    assert wait_for(lambda: assistant.state is State.LISTENING)
+    assistant.mic.push(voice_clips["shutdown"])
+    assert wait_for(lambda: assistant._answer is not None and assistant.state is State.LISTENING)
+    assistant.mic.push(voice_clips["unclear"])            # 听不出同不同意 → 再问一次
+    assert wait_for(lambda: len(assistant.speaker.said) == 2 and assistant._answer is not None
+                    and assistant.state is State.LISTENING)
+    assert assistant.speaker.said[1].startswith("没听清")
+    assert not sent
+    assistant.mic.push(voice_clips["confirm"])
+    assert wait_for(lambda: len(assistant.speaker.said) == 3)
+    assert sent and sent[0][0] == "/s"

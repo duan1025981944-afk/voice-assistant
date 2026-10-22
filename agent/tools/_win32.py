@@ -9,10 +9,12 @@
 from __future__ import annotations
 
 import ctypes
+import functools
 from ctypes import wintypes
 from dataclasses import dataclass
 
 import psutil
+import win32api
 
 user32 = ctypes.WinDLL("user32", use_last_error=True)
 kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -39,8 +41,15 @@ user32.SetForegroundWindow.argtypes = [wintypes.HWND]
 user32.GetForegroundWindow.restype = wintypes.HWND
 user32.AttachThreadInput.argtypes = [wintypes.DWORD, wintypes.DWORD, wintypes.BOOL]
 user32.BringWindowToTop.argtypes = [wintypes.HWND]
+user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+user32.GetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int]
 
 GW_OWNER = 4
+GWL_STYLE, GWL_EXSTYLE = -16, -20
+WS_CAPTION = 0x00C00000
+WS_EX_TOOLWINDOW = 0x00000080
+SW_SHOW = 5
+MAIN_MIN_SIZE = (200, 150)      # 比这小的窗口不当主窗口（悬浮球、托盘弹窗之类）
 
 
 @dataclass
@@ -49,27 +58,67 @@ class Window:
     title: str
     pid: int
     process: str      # 进程名，如 "WeChat.exe"
+    exe: str = ""     # 程序完整路径，拿不到时是空的（比如以管理员身份运行的程序）
+    visible: bool = True
+    main: bool = True # 像不像一个主窗口：不是工具窗口，够大，有标题栏或者看得见
+
+    @property
+    def shown(self) -> bool:
+        """看得见的主窗口。"""
+        return self.visible and self.main
+
+    @property
+    def tucked(self) -> bool:
+        """藏起来的主窗口：点了 × 之后收进托盘的软件，主窗口就是这样。"""
+        return not self.visible and self.main and bool(self.title)
 
 
 def list_windows() -> list[Window]:
-    """列出任务栏上能看到的顶层窗口（可见、有标题、不是别的窗口的附属窗口）。"""
+    """列出所有顶层窗口（包括藏起来的），附属窗口和既没标题又看不见的除外。
+
+    为什么连看不见的也要：很多软件点 × 只是把主窗口藏进托盘，进程还在。
+    不看这些，就会把"在后台运行"误判成"没开"。
+    """
     found: list[Window] = []
+    procs: dict[int, tuple[str, str]] = {}
+
+    def process_of(pid: int) -> tuple[str, str]:
+        if pid not in procs:
+            try:
+                p = psutil.Process(pid)
+                name = p.name()
+                try:
+                    exe = p.exe()
+                except psutil.AccessDenied:
+                    exe = ""
+                procs[pid] = (name, exe)
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                procs[pid] = ("", "")
+        return procs[pid]
 
     def callback(hwnd, _lparam):
-        if not user32.IsWindowVisible(hwnd) or user32.GetWindow(hwnd, GW_OWNER):
+        if user32.GetWindow(hwnd, GW_OWNER):
             return True
+        visible = bool(user32.IsWindowVisible(hwnd))
         length = user32.GetWindowTextLengthW(hwnd)
-        if length == 0:
+        if not visible and length == 0:
             return True
         buf = ctypes.create_unicode_buffer(length + 1)
         user32.GetWindowTextW(hwnd, buf, length + 1)
+
+        rect = wintypes.RECT()
+        user32.GetWindowRect(hwnd, ctypes.byref(rect))
+        big = rect.right - rect.left >= MAIN_MIN_SIZE[0] and rect.bottom - rect.top >= MAIN_MIN_SIZE[1]
+        big = big or bool(user32.IsIconic(hwnd))     # 最小化的窗口报出来只有 160×28，但它是正经主窗口
+        tool = bool(user32.GetWindowLongW(hwnd, GWL_EXSTYLE) & WS_EX_TOOLWINDOW)
+        caption = user32.GetWindowLongW(hwnd, GWL_STYLE) & WS_CAPTION == WS_CAPTION
+        main = not tool and big and (visible or caption)
+
         pid = wintypes.DWORD()
         user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-        try:
-            process = psutil.Process(pid.value).name()
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
-            process = ""
-        found.append(Window(hwnd=hwnd, title=buf.value, pid=pid.value, process=process))
+        name, exe = process_of(pid.value)
+        found.append(Window(hwnd=hwnd, title=buf.value, pid=pid.value, process=name,
+                            exe=exe, visible=visible, main=main))
         return True
 
     user32.EnumWindows(_EnumWindowsProc(callback), 0)
@@ -100,6 +149,25 @@ def bring_to_front(hwnd: int) -> bool:
         if attached:
             user32.AttachThreadInput(me, fg_thread, False)
     return ok
+
+
+def show_window(hwnd: int) -> bool:
+    """把藏进托盘的主窗口重新显示出来，并切到最前面。"""
+    user32.ShowWindow(hwnd, SW_SHOW)
+    return bring_to_front(hwnd)
+
+
+@functools.lru_cache(maxsize=256)
+def file_description(exe: str) -> str:
+    """程序文件里写的产品名，比如 Doubao.exe → "豆包"、Weixin.exe → "微信"。拿不到就返回空串。"""
+    if not exe:
+        return ""
+    try:
+        lang, codepage = win32api.GetFileVersionInfo(exe, r"\VarFileInfo\Translation")[0]
+        key = rf"\StringFileInfo\{lang:04x}{codepage:04x}\FileDescription"
+        return (win32api.GetFileVersionInfo(exe, key) or "").strip()
+    except Exception:
+        return ""
 
 
 def close_window(hwnd: int) -> str | None:
