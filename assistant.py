@@ -103,6 +103,7 @@ TOOL_PROGRESS = {
     "switch_to_app": "正在切换到 {name}",
     "close_app": "正在关闭 {name}",
     "quit_app": "正在彻底退出 {name}",
+    "play_music": "正在网易云里找 {artist} {song}",
     "volume": "正在调音量",
     "brightness": "正在调亮度",
     "media": "正在控制播放",

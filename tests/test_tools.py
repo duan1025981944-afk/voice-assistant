@@ -15,7 +15,7 @@ def test_all_tools_discovered():
     tools = discover_tools()
     assert set(tools) == {
         "brightness", "clock", "close_app", "media", "open_app",
-        "open_url", "power", "quit_app", "switch_to_app", "volume", "web_search",
+        "open_url", "play_music", "power", "quit_app", "switch_to_app", "volume", "web_search",
     }
 
 
@@ -28,7 +28,7 @@ def test_confirm_policy(monkeypatch):
     assert tools["power"].requires_confirm({"action": "restart"})
     for action in ("lock", "sleep", "cancel"):
         assert not tools["power"].requires_confirm({"action": action})
-    for name in ("open_app", "switch_to_app", "volume", "brightness", "media", "web_search", "clock"):
+    for name in ("open_app", "switch_to_app", "volume", "brightness", "media", "web_search", "clock", "play_music"):
         assert not tools[name].requires_confirm({}), name
 
 
