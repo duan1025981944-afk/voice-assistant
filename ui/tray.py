@@ -31,8 +31,9 @@ import win32con
 import win32gui
 from PIL import ImageTk
 
-from assistant import Assistant, State
+from assistant import Assistant, Progress, State, format_cost, format_tokens
 from ui import icons
+from ui.bubble import StatusBubble
 from voice.paths import DATA_DIR
 
 WM_TRAY = win32con.WM_USER + 20
@@ -88,12 +89,19 @@ def pretty_hotkey(spec: str) -> str:
     return " + ".join(p.strip().capitalize() for p in spec.split("+"))
 
 
-def turns_today() -> int:
-    path = DATA_DIR / "events" / f"{date.today():%Y%m%d}.jsonl"
-    if not path.exists():
-        return 0
-    with open(path, encoding="utf-8") as f:
-        return sum(1 for line in f if line.strip())
+def usage_lines(a: Assistant) -> list[str]:
+    """菜单里的用量两行：今天、累计。没配价格就只显示 token。"""
+    lines = []
+    for title, totals in (("今天", a.events.totals(date.today())), ("累计", a.events.totals())):
+        if not totals["since"]:          # 这段时间的记录都是加统计功能之前的
+            lines.append(f"{title}：{totals['turns']} 次对话（还没有用量记录）")
+            continue
+        parts = [f"{totals['turns']} 次对话", f"{format_tokens(totals['tokens'])} token"]
+        cost = format_cost(totals["cost"], a.pricing)
+        if cost:
+            parts.append(cost)
+        lines.append(f"{title}：" + " · ".join(parts))
+    return lines
 
 
 class NotifyIcon(threading.Thread):
@@ -211,7 +219,8 @@ class PopupMenu:
         self._line(body)
         self._info(body, f"唤醒词：{'、'.join(a.settings.wake_words)}")
         self._info(body, f"快捷键：{pretty_hotkey(a.settings.hotkey)}")
-        self._info(body, f"今天对话：{turns_today()} 次")
+        for line in usage_lines(a):
+            self._info(body, line)
         self._line(body)
         self._item(body, "退出", self.tray.quit)
 
@@ -327,11 +336,15 @@ class Tray:
         self.root.withdraw()
         self.icons = icons.write_state_icons()
         self.menu = PopupMenu(self.root, self)
+        self.bubble = None
+        if assistant.settings.show_status:
+            self.bubble = StatusBubble(self.root, self.menu.px, self.menu.font, self.menu._decorate)
         self._events: queue.Queue = queue.Queue()        # 别的线程只往这里放东西，不碰界面
         self.icon = NotifyIcon(on_click=lambda: self._events.put("click"))
         self.icon.start()
         self._show(assistant.state)
         assistant.on_state = self._events.put
+        assistant.on_progress = self._events.put
 
     def run(self) -> None:
         self.root.after(50, self._poll)
@@ -343,10 +356,15 @@ class Tray:
             event = self._events.get_nowait()
             if event == "click":
                 self.menu.toggle()
+            elif isinstance(event, Progress):
+                if self.bubble:
+                    self.bubble.show(event)
             else:
                 latest_state = event
         if latest_state is not None:
             self._show(latest_state)
+        if self.bubble:
+            self.bubble.tick()
         self.root.after(50, self._poll)
 
     def _show(self, state: State) -> None:

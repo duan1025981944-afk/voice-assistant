@@ -33,12 +33,15 @@ import json
 import logging
 import threading
 import time
-from datetime import datetime
+from collections import defaultdict
+from dataclasses import dataclass
+from datetime import date, datetime
 from typing import Callable
 
 from agent.brain import build_runner
 from agent.tools.base import Tool
-from config.schema import VoiceSettings
+from config.loader import load_pricing
+from config.schema import Pricing, VoiceSettings
 from voice.hotkey import Hotkey
 from voice.listen import SpeechCollector, Transcriber
 from voice.mic import Microphone, MicrophoneError
@@ -84,6 +87,68 @@ def classify_answer(answer: str | None) -> bool | None:
     return None
 
 
+@dataclass
+class Progress:
+    """做到哪一步了，给右下角的进度气泡看。start=新一轮开始（计时归零），done=这一轮结束。"""
+
+    text: str
+    start: bool = False
+    done: bool = False
+
+
+# 调工具时气泡上显示的话；{name} 这类占位符用工具参数填
+TOOL_PROGRESS = {
+    "open_app": "正在打开 {name}",
+    "switch_to_app": "正在切换到 {name}",
+    "close_app": "正在关闭 {name}",
+    "volume": "正在调音量",
+    "brightness": "正在调亮度",
+    "media": "正在控制播放",
+    "web_search": "正在搜索 {query}",
+    "open_url": "正在打开 {url}",
+    "power": "正在执行电源操作",
+    "clock": "正在看时间",
+}
+
+
+def tool_progress(name: str, args: dict) -> str:
+    """调工具时气泡上那句话。
+
+    >>> tool_progress("open_app", {"name": "微信"})
+    '正在打开 微信'
+    >>> tool_progress("open_app", {})
+    '正在打开 '
+    >>> tool_progress("new_tool", {})
+    '正在执行 new_tool'
+    """
+    return TOOL_PROGRESS.get(name, f"正在执行 {name}").format_map(defaultdict(str, args))
+
+
+def format_tokens(n: int) -> str:
+    """token 数写成好读的样子。
+
+    >>> [format_tokens(n) for n in (0, 2345, 123456)]
+    ['0', '2,345', '12.3 万']
+    """
+    return f"{n / 10000:.1f} 万" if n >= 100000 else f"{n:,}"
+
+
+def format_cost(cost: float, pricing: Pricing) -> str:
+    """花费写成好读的样子；没配价格返回空串。
+
+    >>> p = Pricing(cache_miss=1)
+    >>> [format_cost(c, p) for c in (0, 0.00213, 0.5)]
+    ['0 元', '0.0021 元', '0.50 元']
+    >>> format_cost(0.1, Pricing())      # 没配价格
+    ''
+    """
+    if not pricing.known:
+        return ""
+    if cost == 0:
+        return f"0 {pricing.currency}"
+    return f"{cost:.4f} {pricing.currency}" if cost < 0.01 else f"{cost:.2f} {pricing.currency}"
+
+
 def _resolve(future: concurrent.futures.Future, value) -> None:
     """给 future 填结果；已经填过（被别的线程抢先取消了）就算了。"""
     try:
@@ -105,6 +170,23 @@ class EventLog:
         with open(path, "a", encoding="utf-8") as f:
             f.write(json.dumps(fields, ensure_ascii=False) + "\n")
 
+    def totals(self, day: date | None = None) -> dict:
+        """某一天（不传就是全部）一共几轮、多少 token、多少钱。早期的记录没有 token 字段，按 0 算。"""
+        pattern = f"{day:%Y%m%d}.jsonl" if day else "*.jsonl"
+        total = {"turns": 0, "tokens": 0, "cost": 0.0, "since": ""}
+        for path in sorted(self.dir.glob(pattern)):
+            with open(path, encoding="utf-8") as f:
+                for line in f:
+                    if not line.strip():
+                        continue
+                    event = json.loads(line)
+                    total["turns"] += 1
+                    total["tokens"] += event.get("prompt_tokens", 0) + event.get("completion_tokens", 0)
+                    total["cost"] += event.get("cost", 0.0)
+                    if not total["since"] and "prompt_tokens" in event:
+                        total["since"] = event["time"][:10]       # 从哪天开始有 token 记录
+        return total
+
 
 class Assistant:
     def __init__(self, settings: VoiceSettings):
@@ -116,10 +198,13 @@ class Assistant:
         self.transcribe = Transcriber()
         self.speaker = Speaker(settings.tts_voice)
         self.runner = build_runner(self._confirm, settings)
+        self.runner.on_tool = lambda name, args: self._progress(tool_progress(name, args))
         self.events = EventLog()
+        self.pricing = load_pricing()
 
         self.state = State.IDLE
-        self.on_state: Callable[[State], None] = lambda s: None     # 托盘会换成自己的
+        self.on_state: Callable[[State], None] = lambda s: None         # 托盘会换成自己的
+        self.on_progress: Callable[[Progress], None] = lambda p: None   # 进度气泡会换成自己的
         self._lock = threading.RLock()
         self._gen = 0
         self._answer: concurrent.futures.Future | None = None       # 正在等"确认吗"的回答
@@ -195,6 +280,16 @@ class Assistant:
             self._listen_started = time.perf_counter()
             self.collector.start(listen_timeout=timeout or self.settings.listen_timeout)
             self._set_state(State.LISTENING)
+            if new_turn:
+                self._progress("在听…", start=True)
+            else:
+                self._progress("等你回答：确认 / 取消")
+
+    def _progress(self, text: str, *, start: bool = False, done: bool = False) -> None:
+        try:
+            self.on_progress(Progress(text, start=start, done=done))
+        except Exception:
+            log.exception("显示进度出错")          # 界面出问题不能影响助手本身
 
     def _cancel_answer(self) -> None:
         if self._answer is not None:
@@ -248,6 +343,7 @@ class Assistant:
             else:
                 chime("cancel")
                 self._set_state(State.IDLE)
+                self._progress("没听到说话", done=True)
             return
         if outcome != "done":
             return
@@ -264,7 +360,9 @@ class Assistant:
         if not text:
             chime("cancel")
             self._set_state(State.IDLE)
+            self._progress("没听清", done=True)
             return
+        self._progress(f"听到「{text}」，在想…")
         asyncio.run_coroutine_threadsafe(
             self._handle_turn(text, self._gen, self._trigger, asr_ms, heard_at), self.loop
         )
@@ -280,34 +378,65 @@ class Assistant:
     # ── 大脑线程 ──────────────────────────────────────────
 
     async def _handle_turn(self, text: str, gen: int, trigger: str, asr_ms: int, heard_at: float) -> None:
-        tools: list[str] = []
+        result = None
         error = None
         try:
             async with self._turn_lock:
                 result = await self.runner.run_turn(text)
-            reply, tools = result.reply, result.tools_called
+            reply = result.reply
         except Exception as exc:
             log.exception("思考失败")
             error = f"{type(exc).__name__}: {exc}"
             network = "Connection" in type(exc).__name__ or "Timeout" in type(exc).__name__
             reply = "网络不通，没法思考。" if network else "出了点问题，没办成。"
+        tools = result.tools_called if result else []
+        usage = result.usage if result else None
         think_ms = round((time.perf_counter() - heard_at) * 1000)
         log.info("回复：%s %s（%d ms）", reply, tools or "", think_ms)
 
+        cost = 0.0
+        if usage:
+            cost = self.pricing.cost(usage.cache_hit_tokens, usage.cache_miss_tokens,
+                                     usage.completion_tokens, datetime.now())
+
+        first_sound = [0.0]
         spoke_at = time.perf_counter()
-        finished = await self._say(reply, gen)
+        finished = await self._say(reply, gen, first_sound)
+        waited = (first_sound[0] or time.perf_counter()) - heard_at     # 你说完到听见回答，等了多久
         self.events.write(
             trigger=trigger, heard=text, asr_ms=asr_ms, think_ms=think_ms, tools=tools,
             reply=reply, speak_ms=round((time.perf_counter() - spoke_at) * 1000),
-            interrupted=not finished, error=error,
+            wait_ms=round(waited * 1000), llm_ms=result.llm_ms if result else [],
+            synth_ms=self.speaker.timing["synth_ms"], play_ms=self.speaker.timing["play_ms"],
+            tts=self.speaker.timing["engine"],
+            prompt_tokens=usage.prompt_tokens if usage else 0,
+            completion_tokens=usage.completion_tokens if usage else 0,
+            cache_hit_tokens=usage.cache_hit_tokens if usage else 0,
+            cost=round(cost, 6), interrupted=not finished, error=error,
         )
+        if gen == self._gen:
+            parts = [f"等了 {waited:.1f} 秒"]
+            if usage:
+                parts.append(f"{format_tokens(usage.prompt_tokens + usage.completion_tokens)} token")
+                if self.pricing.known:
+                    parts.append(format_cost(cost, self.pricing))
+            self._progress(" · ".join(parts), done=True)
         self._set_state(State.IDLE, gen)
 
-    async def _say(self, text: str, gen: int) -> bool:
+    async def _say(self, text: str, gen: int, first_sound: list[float] | None = None) -> bool:
+        """念一句。first_sound 不为空时，在真正出声的那一刻记下时间（算"等了多久"用）。"""
         self._set_state(State.SPEAKING, gen)
         if gen != self._gen:
             return False
-        return await asyncio.to_thread(self.speaker.say, text)
+        self._progress("准备说话…")
+
+        def on_start():
+            if first_sound is not None:
+                first_sound[0] = time.perf_counter()
+            if gen == self._gen:
+                self._progress(f"在说：{text}")
+
+        return await asyncio.to_thread(self.speaker.say, text, on_start)
 
     async def _confirm(self, tool: Tool, args: dict) -> bool:
         """runner 在执行危险操作前调这里：念一句"确定要……吗"，叮一声，再听一句回答。

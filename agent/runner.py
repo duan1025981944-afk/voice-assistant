@@ -26,7 +26,7 @@ from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
 
 from agent.tools.base import Tool, ToolResult
-from providers.base import Provider, ToolCall
+from providers.base import Provider, ToolCall, Usage
 
 log = logging.getLogger("agent")
 
@@ -47,11 +47,20 @@ MAX_MESSAGES = 40
 
 @dataclass
 class TurnResult:
-    """一轮对话的结果。reply 是要念出来的话。"""
+    """一轮对话的结果。reply 是要念出来的话；usage 是这一轮几次调模型加起来的用量。"""
 
     reply: str
     tools_called: list[str] = field(default_factory=list)
     iterations: int = 0
+    usage: Usage = field(default_factory=Usage)
+    llm_ms: list[int] = field(default_factory=list)      # 每次调模型各花了多久
+
+
+def add_usage(total: Usage, more: Usage) -> None:
+    total.prompt_tokens += more.prompt_tokens
+    total.completion_tokens += more.completion_tokens
+    total.cache_hit_tokens += more.cache_hit_tokens
+    total.cache_miss_tokens += more.cache_miss_tokens
 
 
 class VoiceRunner:
@@ -64,6 +73,7 @@ class VoiceRunner:
         system_prompt: str,
         *,
         confirm: ConfirmFn | None = None,
+        on_tool: Callable[[str, dict], None] | None = None,
         max_iterations: int = 6,
         context_seconds: float = 300,
         clock: Callable[[], float] = time.monotonic,
@@ -72,6 +82,7 @@ class VoiceRunner:
         self.tools = tools
         self.system_prompt = system_prompt
         self.confirm = confirm
+        self.on_tool = on_tool                   # 开始执行某个工具前通知一声（界面显示"正在打开微信"）
         self.max_iterations = max_iterations
         self.context_seconds = context_seconds
         self._clock = clock                      # 测试里换成假时钟
@@ -92,13 +103,18 @@ class VoiceRunner:
             for i in range(1, self.max_iterations + 1):
                 result.iterations = i
                 payload = [{"role": "system", "content": self.system_prompt}, *self.messages]
+                started = time.perf_counter()
                 reply = await self.provider.chat(payload, tools=self._schemas)
+                result.llm_ms.append(round((time.perf_counter() - started) * 1000))
+                add_usage(result.usage, reply.usage)
                 self.messages.append(reply.raw)
                 if not reply.wants_tools:
                     result.reply = (reply.content or "").strip() or "好的。"
                     break
                 for call in reply.tool_calls:
                     result.tools_called.append(call.name)
+                    if self.on_tool:
+                        self.on_tool(call.name, call.arguments)
                     output = await self._execute(call)
                     # 工具返回了什么要记下来：模型转述时可能说偏，排查时得看原话
                     log.info("工具 %s %s → %s", call.name, call.arguments, str(output)[:200])

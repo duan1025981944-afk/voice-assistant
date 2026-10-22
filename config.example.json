@@ -7,7 +7,18 @@
     }
   },
   "modelPresets": {
-    "ds": { "provider": "deepseek", "model": "deepseek-flash" }
+    "ds": {
+      "provider": "deepseek",
+      "model": "deepseek-flash",
+      "pricing": {
+        "currency": "元",
+        "cacheHit": 0.02,
+        "cacheMiss": 1.0,
+        "output": 4.0,
+        "peakMultiplier": 2,
+        "peakHours": ["09:00-12:00", "14:00-18:00"]
+      }
+    }
   },
   "agents": {
     "defaults": { "modelPreset": "ds", "maxIterations": 6 }
@@ -19,6 +30,7 @@
     "inputDevice": null,
     "ttsVoice": "zh-CN-XiaoxiaoNeural",
     "searchEngine": "bing",
+    "showStatus": true,
     "appAliases": {
       "网易云": "网易云音乐",
       "浏览器": "Microsoft Edge"

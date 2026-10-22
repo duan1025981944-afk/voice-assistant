@@ -16,6 +16,7 @@ import threading
 import time
 import wave
 from pathlib import Path
+from typing import Callable
 
 import numpy as np
 import sounddevice as sd
@@ -23,7 +24,11 @@ import sounddevice as sd
 log = logging.getLogger(__name__)
 
 EDGE_RATE = 24000
-EDGE_TIMEOUT = 6.0
+# 实测 edge-tts 第一段声音 0.9–1.5 秒到、整句 1.1–2 秒合成完。
+# 按"多久没收到新数据"判断卡住，比按总时长判断快：卡住时 2.5 秒就换 SAPI，不用等满 6 秒
+EDGE_FIRST_CHUNK = 2.5
+EDGE_NEXT_CHUNK = 2.0
+EDGE_TOTAL = 10.0
 EDGE_COOLDOWN = 300        # edge-tts 失败一次后，这么多秒内直接用 SAPI，不再每句都等超时
 
 
@@ -33,16 +38,29 @@ class Speaker:
         self._stop = threading.Event()
         self._lock = threading.Lock()          # 同一时间只念一句
         self._edge_down_until = 0.0
+        self.timing = {"synth_ms": 0, "play_ms": 0, "engine": ""}   # 最近一句的耗时，记进每轮记录
 
-    def say(self, text: str) -> bool:
-        """念完返回 True，被 stop() 打断返回 False。会阻塞到念完为止。"""
+    def say(self, text: str, on_start: Callable[[], None] | None = None) -> bool:
+        """念完返回 True，被 stop() 打断返回 False。会阻塞到念完为止。
+
+        on_start：合成完、真正开始出声的那一刻调一下（界面从"准备说话"换成"在说"）。
+        """
         text = text.strip()
         if not text:
             return True
         with self._lock:
             self._stop.clear()
+            started = time.perf_counter()
             samples, rate = self.synthesize(text)
-            return self._play(samples, rate)
+            played = time.perf_counter()
+            self.timing["synth_ms"] = round((played - started) * 1000)
+            if self._stop.is_set():
+                return False
+            if on_start:
+                on_start()
+            finished = self._play(samples, rate)
+            self.timing["play_ms"] = round((time.perf_counter() - played) * 1000)
+            return finished
 
     def stop(self) -> None:
         self._stop.set()
@@ -50,10 +68,13 @@ class Speaker:
     def synthesize(self, text: str) -> tuple[np.ndarray, int]:
         if time.monotonic() >= self._edge_down_until:
             try:
-                return self._edge(text), EDGE_RATE
+                samples = self._edge(text)
+                self.timing["engine"] = "edge"
+                return samples, EDGE_RATE
             except Exception as exc:
                 log.warning("edge-tts 失败（%r），%d 秒内改用系统语音", exc, EDGE_COOLDOWN)
                 self._edge_down_until = time.monotonic() + EDGE_COOLDOWN
+        self.timing["engine"] = "sapi"
         return self._sapi(text)
 
     def _edge(self, text: str) -> np.ndarray:
@@ -62,12 +83,19 @@ class Speaker:
 
         async def fetch() -> bytes:
             parts = []
-            async for chunk in edge_tts.Communicate(text, self.voice).stream():
+            stream = edge_tts.Communicate(text, self.voice).stream().__aiter__()
+            wait = EDGE_FIRST_CHUNK
+            while True:
+                try:
+                    chunk = await asyncio.wait_for(stream.__anext__(), wait)
+                except StopAsyncIteration:
+                    break
+                wait = EDGE_NEXT_CHUNK
                 if chunk["type"] == "audio":
                     parts.append(chunk["data"])
             return b"".join(parts)
 
-        mp3 = asyncio.run(asyncio.wait_for(fetch(), EDGE_TIMEOUT))
+        mp3 = asyncio.run(asyncio.wait_for(fetch(), EDGE_TOTAL))
         if not mp3:
             raise RuntimeError("没有收到音频")
         decoded = miniaudio.decode(

@@ -14,7 +14,7 @@ import os
 import re
 from pathlib import Path
 
-from .schema import AgentDefaults, ResolvedModel, VoiceSettings
+from .schema import AgentDefaults, Pricing, ResolvedModel, VoiceSettings
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 CONFIG_FILE = PROJECT_ROOT / "config.json"
@@ -38,6 +38,16 @@ _VOICE_KEYS = {
     "contextMinutes": "context_minutes",
     "searchEngine": "search_engine",
     "appAliases": "app_aliases",
+    "showStatus": "show_status",
+}
+
+_PRICING_KEYS = {
+    "currency": "currency",
+    "cacheHit": "cache_hit",
+    "cacheMiss": "cache_miss",
+    "output": "output",
+    "peakMultiplier": "peak_multiplier",
+    "peakHours": "peak_hours",
 }
 
 
@@ -113,6 +123,17 @@ def load_agent_defaults(path: str | Path | None = None) -> AgentDefaults:
     """一轮最多调几次模型。语音指令都很短，默认 6 圈就够。"""
     defaults = _read_raw(path, expand=False).get("agents", {}).get("defaults", {})
     return AgentDefaults(max_iterations=int(defaults.get("maxIterations", 6)))
+
+
+def load_pricing(path: str | Path | None = None) -> Pricing:
+    """当前 preset 的价格（modelPresets.<名字>.pricing）。没写就是全 0：只统计 token，不算钱。"""
+    raw = _read_raw(path, expand=False)
+    preset_name = raw.get("agents", {}).get("defaults", {}).get("modelPreset")
+    pricing = raw.get("modelPresets", {}).get(preset_name, {}).get("pricing", {})
+    unknown = set(pricing) - set(_PRICING_KEYS)
+    if unknown:
+        raise ValueError(f"pricing 里有不认识的配置项：{', '.join(sorted(unknown))}。可用的有：{', '.join(_PRICING_KEYS)}")
+    return Pricing(**{_PRICING_KEYS[k]: v for k, v in pricing.items()})
 
 
 def load_voice_settings(path: str | Path | None = None) -> VoiceSettings:

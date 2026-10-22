@@ -132,3 +132,17 @@ def test_context_expires():
     now[0] = 60 + 301
     run(runner.run_turn("第三句"))
     assert len(provider.seen[2]) == 2      # 过期了，只剩 system + 第三句
+
+
+def test_usage_is_summed_over_calls():
+    from providers.base import Usage
+    first, second = tool_reply("rec", {}), text_reply("好")
+    first.usage = Usage(prompt_tokens=1000, completion_tokens=20, cache_hit_tokens=900, cache_miss_tokens=100)
+    second.usage = Usage(prompt_tokens=1100, completion_tokens=10, cache_hit_tokens=1000, cache_miss_tokens=100)
+    seen_tools = []
+    runner, _ = make_runner([first, second], [Recorder()])
+    runner.on_tool = lambda name, args: seen_tools.append(name)
+    result = run(runner.run_turn("x"))
+    assert (result.usage.prompt_tokens, result.usage.completion_tokens) == (2100, 30)
+    assert (result.usage.cache_hit_tokens, result.usage.cache_miss_tokens) == (1900, 200)
+    assert len(result.llm_ms) == 2 and seen_tools == ["rec"]

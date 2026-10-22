@@ -44,7 +44,11 @@ class FakeSpeaker:
         self.said = []
         self.spoke = threading.Event()
 
-    def say(self, text):
+    timing = {"synth_ms": 0, "play_ms": 0, "engine": "fake"}
+
+    def say(self, text, on_start=None):
+        if on_start:
+            on_start()
         self.said.append(text)
         self.spoke.set()
         return True
@@ -80,6 +84,8 @@ def assistant(monkeypatch, tmp_path):
     a = assistant_mod.Assistant(VoiceSettings())
     a.mic, a.speaker = FakeMic(), FakeSpeaker()
     a.events.dir = tmp_path
+    a.progress_log = []
+    a.on_progress = a.progress_log.append
     a.runner.provider = ScriptedProvider([])
     a._brain.start()
     a._ears.start()
@@ -109,6 +115,17 @@ def test_wake_then_answer(assistant, voice_clips):
     assert assistant.speaker.said == ["现在三点"]
     assert "几点" in provider.seen[0][-1]["content"]
     assert wait_for(lambda: assistant.state is State.IDLE)
+
+    # 进度：在听 → 听到…在想 → 正在看时间 → 准备说话 → 在说 → 结束（带用时）
+    steps = [p.text for p in assistant.progress_log]
+    assert steps[0] == "在听…" and assistant.progress_log[0].start
+    assert any(t.startswith("听到「") for t in steps)
+    assert "正在看时间" in steps and "在说：现在三点" in steps
+    assert assistant.progress_log[-1].done and steps[-1].startswith("等了")
+
+    # 每轮记录里有 token 和花费（假模型的用量是 0）
+    totals = assistant.events.totals()
+    assert totals["turns"] == 1 and totals["tokens"] == 0
 
 
 @pytest.mark.parametrize("answer, executed", [("cancel", False), ("confirm", True), ("close_it", True)])
