@@ -12,7 +12,7 @@
 
 - **听**全在本机：唤醒词、断句、识别（sherpa-onnx + SenseVoice），录音不离开电脑
 - **想**用 DeepSeek：只有识别出来的文字会发出去
-- **说**用 edge-tts（声音自然，会把回复发给微软合成）；断网时自动换成 Windows 自带语音
+- **说**用 edge-tts（声音自然，会把回复发给微软合成），边收边播；连不上时不换成机器音，把这句话显示在进度气泡里
 - 说话时喊唤醒词可以打断它
 
 ---
@@ -79,7 +79,8 @@ API key 和 mini_nanobot 用的是同一个环境变量 `DEEPSEEK_API_KEY`，已
 | --- | --- | --- |
 | `open_app` | 打开微信 / 打开网易云 | 不用 |
 | `switch_to_app` | 切到 Chrome | 不用 |
-| `close_app` | 关掉记事本（等于点 ×，不强制结束） | **要** |
+| `close_app` | 关掉记事本（有窗口就点 ×；只在托盘/后台的，确认后彻底退出） | **要** |
+| `quit_app` | 彻底退出微信（连托盘和后台进程一起结束，没保存的会丢） | **要** |
 | `volume` | 音量调到 30 / 大一点 / 静音 | 不用 |
 | `brightness` | 亮度调到 50 | 不用 |
 | `media` | 暂停 / 下一首 | 不用 |
@@ -87,7 +88,8 @@ API key 和 mini_nanobot 用的是同一个环境变量 `DEEPSEEK_API_KEY`，已
 | `power` | 锁屏 / 睡眠 / 关机 / 重启 / 取消关机 | 关机、重启**要** |
 | `clock` | 几点了 | 不用 |
 
-删除文件、执行命令、改注册表、强制结束进程：**没有这些工具**，模型想做也做不了。
+删除文件、执行命令、改注册表：**没有这些工具**，模型想做也做不了。
+彻底退出只能结束你自己的普通程序：系统进程、资源管理器、杀毒软件、装在 Windows 目录里的程序、以管理员身份运行的程序都碰不了。
 
 要确认时：它先问"确定要关闭豆包吗？"，**叮**一声后再回答。
 "确认 / 确定 / 对 / 好 / 关吧 / 关掉 / yes"都算同意，"不 / 取消 / 算了 / no"算不同意；
@@ -126,6 +128,8 @@ API key 和 mini_nanobot 用的是同一个环境变量 `DEEPSEEK_API_KEY`，已
 - `wakeWords`：唤醒词，3–5 个字效果最好，可以写多个
 - `wakeThreshold` / `wakeScore`：唤醒不灵就调小 threshold、调大 score；误唤醒多就反过来
 - `hotkey`：如 `"ctrl+alt+j"`
+- `ttsVoice` / `ttsRate` / `ttsPitch`：音色、语速、音调，如 `"zh-CN-XiaoyiNeural"`、`"+8%"`、`"+15Hz"`。
+  中文音色有：XiaoxiaoNeural（温暖）、XiaoyiNeural（活泼、卡通）、YunxiNeural、YunxiaNeural、liaoning-XiaobeiNeural（东北话）、shaanxi-XiaoniNeural（陕西话）等，前面都加 `zh-CN-`
 - `appAliases`：你的叫法 → 开始菜单里的正式名，如 `{"网易云": "网易云音乐"}`
 
 ## 架构

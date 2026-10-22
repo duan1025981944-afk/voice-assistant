@@ -31,6 +31,8 @@ _VOICE_KEYS = {
     "hotkey": "hotkey",
     "inputDevice": "input_device",
     "ttsVoice": "tts_voice",
+    "ttsRate": "tts_rate",
+    "ttsPitch": "tts_pitch",
     "confirmTimeoutSec": "confirm_timeout",
     "listenTimeoutSec": "listen_timeout",
     "endSilenceSec": "end_silence",

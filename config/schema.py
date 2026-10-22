@@ -91,7 +91,9 @@ class VoiceSettings:
         wake_score         唤醒词的加分，越大越容易唤醒（wakeScore）
         hotkey             按一下就开始听的快捷键（hotkey），如 "win+alt+space"
         input_device       麦克风：null 用系统默认，也可以写设备编号或名字的一部分（inputDevice）
-        tts_voice          edge-tts 的音色（ttsVoice）
+        tts_voice          edge-tts 的音色（ttsVoice），如 zh-CN-XiaoyiNeural
+        tts_rate           语速，如 "+10%"（ttsRate）
+        tts_pitch          音调，如 "+15Hz"，越大声音越尖越萌（ttsPitch）
         confirm_timeout    问"确认吗"之后等几秒（confirmTimeoutSec）
         listen_timeout     唤醒后几秒还没开口就放弃（listenTimeoutSec）
         end_silence        说完之后停顿多久算"说完了"（endSilenceSec）
@@ -109,6 +111,8 @@ class VoiceSettings:
     hotkey: str = "win+alt+space"
     input_device: int | str | None = None
     tts_voice: str = "zh-CN-XiaoxiaoNeural"
+    tts_rate: str = "+0%"
+    tts_pitch: str = "+0Hz"
     confirm_timeout: float = 8.0
     listen_timeout: float = 6.0
     end_silence: float = 0.7

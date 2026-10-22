@@ -28,7 +28,9 @@
     "wakeWords": ["大肥鱼"],
     "hotkey": "win+alt+space",
     "inputDevice": null,
-    "ttsVoice": "zh-CN-XiaoxiaoNeural",
+    "ttsVoice": "zh-CN-XiaoyiNeural",
+    "ttsRate": "+8%",
+    "ttsPitch": "+15Hz",
     "searchEngine": "bing",
     "showStatus": true,
     "appAliases": {

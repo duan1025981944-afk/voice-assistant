@@ -9,7 +9,6 @@ pypinyin              # 唤醒词转拼音 token
 sentencepiece         # sherpa_onnx.text2token 会 import 它
 edge-tts              # 在线合成（声音自然）
 miniaudio             # 把 edge-tts 的 mp3 解码成 PCM
-pyttsx3               # 断网兜底：系统自带的 SAPI 中文语音
 
 # 手：桌面控制，全部不需要管理员权限
 pycaw
@@ -24,3 +23,4 @@ Pillow
 
 # 测试
 pytest>=8.0
+pyttsx3               # 只在测试里用：edge-tts 连不上时，用系统语音合成测试音频

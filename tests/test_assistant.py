@@ -59,10 +59,8 @@ class FakeSpeaker:
 @pytest.fixture(scope="module")
 def voice_clips():
     """先把要用到的几句话合成好（16kHz）。"""
-    from tests.test_voice import silence, to_16k
-    from voice.tts import Speaker
-    sp = Speaker()
-    clip = lambda t: to_16k(*sp.synthesize(t))
+    from tests.test_voice import silence
+    from tests.tts_helper import synthesize as clip
     return {
         "wake": np.concatenate([silence(0.5), clip("你好小智"), silence(0.3)]),
         "time": np.concatenate([clip("现在几点了"), silence(1.5)]),

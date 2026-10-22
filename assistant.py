@@ -46,14 +46,15 @@ from voice.hotkey import Hotkey
 from voice.listen import SpeechCollector, Transcriber
 from voice.mic import Microphone, MicrophoneError
 from voice.paths import DATA_DIR
-from voice.tts import Speaker, chime
+from voice.tts import Speaker, SpeechError, chime
 from voice.wake import WakeWordDetector
 
 log = logging.getLogger("assistant")
 
-# 确认时的回答怎么算。会问确认的只有"关软件 / 关机 / 重启"，所以"关""重启"本身就算同意。
+# 确认时的回答怎么算。会问确认的只有"关软件 / 退出软件 / 关机 / 重启"，
+# 所以"关""退出""重启"本身就算同意（"不退出"会先被否定词拦下）。
 YES = ("确认", "确定", "同意", "是", "对", "好", "行", "可以", "嗯", "没问题", "没错", "当然",
-       "执行", "要", "关", "重启", "yes", "yeah", "ok", "sure")
+       "执行", "要", "关", "退出", "重启", "yes", "yeah", "ok", "sure")
 NO = ("不", "别", "取消", "算了", "停", "等等", "no")
 
 
@@ -70,10 +71,10 @@ def classify_answer(answer: str | None) -> bool | None:
 
     先看否定词（"不确定""不要关"里也有肯定的字），再看肯定词。
 
-    >>> [classify_answer(a) for a in ["确认", "关闭吧", "关掉", "YES", "对对对", "好的关吧"]]
-    [True, True, True, True, True, True]
-    >>> [classify_answer(a) for a in ["不确定", "不要关", "取消", "算了吧", "No."]]
-    [False, False, False, False, False]
+    >>> [classify_answer(a) for a in ["确认", "关闭吧", "关掉", "YES", "对对对", "好的关吧", "退出吧"]]
+    [True, True, True, True, True, True, True]
+    >>> [classify_answer(a) for a in ["不确定", "不要关", "取消", "算了吧", "No.", "先不退出"]]
+    [False, False, False, False, False, False]
     >>> [classify_answer(a) for a in ["啊？", "什么", "", None]]
     [None, None, None, None]
     """
@@ -101,6 +102,7 @@ TOOL_PROGRESS = {
     "open_app": "正在打开 {name}",
     "switch_to_app": "正在切换到 {name}",
     "close_app": "正在关闭 {name}",
+    "quit_app": "正在彻底退出 {name}",
     "volume": "正在调音量",
     "brightness": "正在调亮度",
     "media": "正在控制播放",
@@ -147,6 +149,14 @@ def format_cost(cost: float, pricing: Pricing) -> str:
     if cost == 0:
         return f"0 {pricing.currency}"
     return f"{cost:.4f} {pricing.currency}" if cost < 0.01 else f"{cost:.2f} {pricing.currency}"
+
+
+def _warm_up() -> None:
+    try:
+        from agent.tools import apps
+        apps.process_groups()
+    except Exception:
+        log.exception("预热软件列表失败（不影响使用，第一次用时会慢一点）")
 
 
 def _resolve(future: concurrent.futures.Future, value) -> None:
@@ -196,7 +206,7 @@ class Assistant:
         self.wake = WakeWordDetector(settings.wake_words, settings.wake_threshold, settings.wake_score)
         self.collector = SpeechCollector(settings.end_silence, settings.max_speech)
         self.transcribe = Transcriber()
-        self.speaker = Speaker(settings.tts_voice)
+        self.speaker = Speaker(settings.tts_voice, settings.tts_rate, settings.tts_pitch)
         self.runner = build_runner(self._confirm, settings)
         self.runner.on_tool = lambda name, args: self._progress(tool_progress(name, args))
         self.events = EventLog()
@@ -232,6 +242,8 @@ class Assistant:
         self.hotkey.ready.wait(2)
         if self.hotkey.error:
             log.warning(self.hotkey.error)
+        # 后台先把开始菜单和程序信息读一遍（第一次要 1 秒左右），第一次说"打开/关掉 X"时就不用等
+        threading.Thread(target=_warm_up, name="warm-up", daemon=True).start()
         words = "、".join(self.settings.wake_words)
         log.info("就绪。说「%s」或按 %s 开始", words, self.settings.hotkey)
 
@@ -436,7 +448,15 @@ class Assistant:
             if gen == self._gen:
                 self._progress(f"在说：{text}")
 
-        return await asyncio.to_thread(self.speaker.say, text, on_start)
+        try:
+            return await asyncio.to_thread(self.speaker.say, text, on_start)
+        except SpeechError as exc:
+            # 按要求不换成系统语音：念不出来就把这句话显示在气泡里，响一声提示去看
+            log.warning("%s，这句没念：%s", exc, text)
+            chime("cancel")
+            if gen == self._gen:
+                self._progress(f"（网络不好，没念出来）{text}")
+            return True
 
     async def _confirm(self, tool: Tool, args: dict) -> bool:
         """runner 在执行危险操作前调这里：念一句"确定要……吗"，叮一声，再听一句回答。

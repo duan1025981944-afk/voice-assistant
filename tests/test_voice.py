@@ -17,17 +17,12 @@ pytestmark = [
 
 @pytest.fixture(scope="module")
 def speaker():
-    from voice.tts import Speaker
-    return Speaker()
+    return None                  # 兼容旧写法：合成交给 tests/tts_helper.py
 
 
-def to_16k(samples: np.ndarray, rate: int) -> np.ndarray:
-    n = int(len(samples) * SAMPLE_RATE / rate)
-    return np.interp(np.linspace(0, len(samples) - 1, n), np.arange(len(samples)), samples).astype(np.float32)
-
-
-def say(speaker, text: str) -> np.ndarray:
-    return to_16k(*speaker.synthesize(text))
+def say(_speaker, text: str) -> np.ndarray:
+    from tests.tts_helper import synthesize
+    return synthesize(text)
 
 
 def silence(seconds: float) -> np.ndarray:
@@ -79,3 +74,35 @@ def test_collector_done_and_timeout(speaker, transcriber):
     col.start(listen_timeout=2)
     outcomes = [col.feed(b) for b in blocks(silence(3))]
     assert "timeout" in outcomes
+
+
+# ── 边收边播（不出声：用假声卡；不联网：用假的收音线程）──
+
+def test_queue_source_gives_what_it_has():
+    """解码器要 64KB 时，手里有多少先给多少，不等凑够——这是能"边收边播"的关键。"""
+    import queue as q
+    from voice.tts import _QueueSource
+    chunks = q.Queue()
+    chunks.put(b"a" * 100)
+    source = _QueueSource(chunks)
+    assert source.read(65536) == b"a" * 100
+    chunks.put(b"b" * 10)
+    chunks.put(None)
+    assert source.read(65536) == b"b" * 10
+    assert source.read(65536) == b"" and source.finished
+
+
+def test_no_fallback_voice_when_edge_fails(monkeypatch):
+    """连不上时重试一次，再不行抛 SpeechError——不会悄悄换成系统机器音。"""
+    from voice import tts
+    calls = []
+
+    def broken_fetch(self, text, chunks, stop):
+        calls.append(text)
+        chunks.put(TimeoutError("连不上"))
+
+    monkeypatch.setattr(tts.Speaker, "_fetch", broken_fetch)
+    monkeypatch.setattr(tts.sd, "OutputStream", lambda **kw: pytest.fail("不该打开声卡"))
+    with pytest.raises(tts.SpeechError):
+        tts.Speaker().say("你好")
+    assert calls == ["你好", "你好"]

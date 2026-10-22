@@ -15,13 +15,15 @@ def test_all_tools_discovered():
     tools = discover_tools()
     assert set(tools) == {
         "brightness", "clock", "close_app", "media", "open_app",
-        "open_url", "power", "switch_to_app", "volume", "web_search",
+        "open_url", "power", "quit_app", "switch_to_app", "volume", "web_search",
     }
 
 
-def test_confirm_policy():
+def test_confirm_policy(monkeypatch):
     tools = discover_tools()
+    monkeypatch.setattr(apps, "_close_plan", lambda name: ("windows", object()))
     assert tools["close_app"].requires_confirm({"name": "微信"})
+    assert tools["quit_app"].requires_confirm({"name": "豆包"})
     assert tools["power"].requires_confirm({"action": "shutdown"})
     assert tools["power"].requires_confirm({"action": "restart"})
     for action in ("lock", "sleep", "cancel"):
@@ -136,6 +138,7 @@ def fake_running(monkeypatch):
     monkeypatch.setattr(apps, "installed_apps", lambda refresh=False: FAKE_MENU)
     monkeypatch.setattr(apps._win32, "list_windows", lambda: FAKE_WINDOWS)
     monkeypatch.setattr(apps._win32, "file_description", lambda exe: "")
+    monkeypatch.setattr(apps, "find_process", lambda name: (None, []))   # 不去看真实的进程
 
 
 @pytest.mark.parametrize("said, label, shown, tucked", [
@@ -149,13 +152,14 @@ def test_find_running(fake_running, said, label, shown, tucked):
     assert (len(app.shown), len(app.tucked)) == (shown, tucked)
 
 
-def test_close_tray_app_does_not_ask_and_says_why(fake_running, monkeypatch):
+def test_close_tray_app_goes_to_quit(fake_running, monkeypatch):
+    """豆包只有收进托盘的窗口：不关窗口（关了也没用），改走"彻底退出"。"""
+    group = fake_group()
+    monkeypatch.setattr(apps, "find_process", lambda name: (group, []))
     closed = []
     monkeypatch.setattr(apps._win32, "close_window", lambda hwnd: closed.append(hwnd))
-    tool = apps.CloseAppTool()
-    assert not tool.requires_confirm({"name": "豆包"})
-    out = run(tool.execute("豆包"))
-    assert "后台运行" in out and not closed
+    assert apps._close_plan("豆包") == ("quit", group)
+    assert not closed
 
 
 def test_close_not_running(fake_running):
@@ -174,3 +178,61 @@ def test_close_open_app_asks_and_closes(fake_running, monkeypatch):
     assert tool.requires_confirm({"name": "记事本"})
     assert run(tool.execute("记事本")) == "已关闭记事本"
     assert closed == [3]
+
+
+
+# ── 彻底退出：用假进程测，绝不结束真的程序 ──
+
+class FakeProc:
+    def __init__(self, pid):
+        self.pid, self.terminated = pid, False
+
+    def terminate(self):
+        self.terminated = True
+
+
+def fake_group(label="豆包", protected=False, n=3):
+    return apps.ProcessGroup(label, "Doubao.exe", [FakeProc(i) for i in range(n)], protected, ["doubao"])
+
+
+@pytest.fixture
+def no_real_windows(monkeypatch):
+    monkeypatch.setattr(apps._win32, "list_windows", lambda: [])
+    # 第一次等待：都还活着（托盘软件收到"关闭"不会退出）；强制结束后再等：都没了
+    monkeypatch.setattr(apps.psutil, "wait_procs",
+                        lambda procs, timeout: (([], list(procs)) if not any(p.terminated for p in procs)
+                                                else (list(procs), [])))
+
+
+def test_quit_group_terminates_after_grace(no_real_windows):
+    group = fake_group()
+    assert apps.quit_group(group) == "已彻底退出豆包"
+    assert all(p.terminated for p in group.procs)
+
+
+def test_quit_group_refuses_system_programs(no_real_windows):
+    group = fake_group("Windows 资源管理器", protected=True)
+    out = apps.quit_group(group)
+    assert out.is_error and "系统程序" in out
+    assert not any(p.terminated for p in group.procs)
+
+
+def test_close_background_app_asks_then_quits(monkeypatch):
+    group = fake_group()
+    monkeypatch.setattr(apps, "find_running", lambda name: (None, []))
+    monkeypatch.setattr(apps, "find_process", lambda name: (group, []))
+    quit_calls = []
+    monkeypatch.setattr(apps, "quit_group", lambda g: quit_calls.append(g) or "已彻底退出豆包")
+    tool = apps.CloseAppTool()
+    assert tool.requires_confirm({"name": "豆包"})
+    assert tool.confirm_prompt({"name": "豆包"}) == "豆包在后台运行，要彻底退出它吗？"
+    assert run(tool.execute("豆包")) == "已彻底退出豆包"
+    assert quit_calls == [group]
+
+
+def test_close_protected_does_not_ask(monkeypatch):
+    monkeypatch.setattr(apps, "find_running", lambda name: (None, []))
+    monkeypatch.setattr(apps, "find_process", lambda name: (fake_group("Windows 资源管理器", protected=True), []))
+    tool = apps.CloseAppTool()
+    assert not tool.requires_confirm({"name": "资源管理器"})
+    assert "系统程序" in run(tool.execute("资源管理器"))

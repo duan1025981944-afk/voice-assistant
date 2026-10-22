@@ -312,17 +312,106 @@ def find_running(name: str, apps: list[RunningApp] | None = None) -> tuple[Runni
     正在运行的程序不一定叫那个名字（资源管理器进程写的是"Windows 资源管理器"）。
     """
     apps = running_apps() if apps is None else apps
-    items = [(a, a.keys()) for a in apps]
-    best: dict[int, tuple[RunningApp, float]] = {}
+    return pick(_rank_both(name, [(a, a.keys()) for a in apps]))
+
+
+def _rank_both(name: str, items: list[tuple[object, list[str]]]) -> list[tuple[object, float]]:
+    """原话和别名各排一次，每个东西取两次里的高分。"""
+    best: dict[int, tuple[object, float]] = {}
     for query in {name, resolve_alias(name)}:
-        for app, s in rank(query, items):
-            if id(app) not in best or s > best[id(app)][1]:
-                best[id(app)] = (app, s)
-    return pick(sorted(best.values(), key=lambda pair: pair[1], reverse=True))
+        for obj, s in rank(query, items):
+            if id(obj) not in best or s > best[id(obj)][1]:
+                best[id(obj)] = (obj, s)
+    return sorted(best.values(), key=lambda pair: pair[1], reverse=True)
 
 
 def _process_alive(process: str) -> bool:
     return any(p.info["name"] == process for p in psutil.process_iter(["name"]))
+
+
+# ── 彻底退出（连后台进程一起结束）──────────────────────────
+#
+# 豆包、微信这类软件点 × 只是收进托盘，要真正退出只能结束进程。
+# 这是"强制"的：软件没机会保存，所以一定先语音确认，而且下面这些绝不碰——
+#   系统核心进程、桌面和任务栏（explorer）、杀毒软件、装在 Windows 目录里的程序、
+#   别的用户或以管理员身份运行的进程（本来也结束不了）、语音助手自己。
+
+PROTECTED_PROCESSES = {
+    "system", "registry", "smss.exe", "csrss.exe", "wininit.exe", "winlogon.exe", "services.exe",
+    "lsass.exe", "svchost.exe", "dwm.exe", "explorer.exe", "fontdrvhost.exe", "sihost.exe",
+    "ctfmon.exe", "taskhostw.exe", "runtimebroker.exe", "searchhost.exe", "conhost.exe",
+    "startmenuexperiencehost.exe", "shellexperiencehost.exe", "textinputhost.exe",
+    "applicationframehost.exe", "audiodg.exe", "msmpeng.exe", "nissrv.exe",
+    "securityhealthsystray.exe", "securityhealthservice.exe", "python.exe", "pythonw.exe",
+}
+WINDOWS_DIR = os.environ.get("SystemRoot", r"C:\Windows").lower() + "\\"
+QUIT_GRACE = 1.5          # 先发"关闭"，等这么久还没退出再强制结束
+
+
+@dataclass
+class ProcessGroup:
+    label: str
+    process: str                       # exe 名，如 "Doubao.exe"
+    procs: list[psutil.Process]
+    protected: bool                    # 系统程序：找得到，但不许结束
+    keys: list[str]
+
+
+def process_groups() -> list[ProcessGroup]:
+    """当前用户所有正在运行的程序，按 exe 名归组（豆包有十几个 Doubao.exe 进程，算一个）。"""
+    me = psutil.Process()
+    try:
+        my_user = me.username()
+    except psutil.AccessDenied:
+        my_user = None
+    mine = {me.pid, me.ppid()}
+    by_name: dict[str, list[psutil.Process]] = {}
+    for p in psutil.process_iter(["name", "exe", "username"]):
+        name = (p.info["name"] or "").lower()
+        if name and p.pid not in mine and p.info["username"] == my_user:
+            by_name.setdefault(name, []).append(p)
+
+    windows = _win32.list_windows()
+    groups = []
+    for name, procs in by_name.items():
+        exe = next((p.info["exe"] for p in procs if p.info["exe"]), "")
+        process = procs[0].info["name"]
+        ws = [w for w in windows if w.process.lower() == name]
+        label = _label(ws) if ws else _label([_win32.Window(0, "", 0, process, exe, False, False)])
+        texts = {process.removesuffix(".exe"), _win32.file_description(exe), label,
+                 *start_menu_names(exe, process), *(w.title for w in ws if w.main and w.title)}
+        protected = name in PROTECTED_PROCESSES or exe.lower().startswith(WINDOWS_DIR)
+        groups.append(ProcessGroup(label, process, procs, protected,
+                                   [k for t in texts if t for k in keys_for(t)]))
+    return groups
+
+
+def find_process(name: str, groups: list[ProcessGroup] | None = None) -> tuple[ProcessGroup | None, list[ProcessGroup]]:
+    groups = process_groups() if groups is None else groups
+    return pick(_rank_both(name, [(g, g.keys) for g in groups]))
+
+
+def quit_group(group: ProcessGroup) -> str:
+    """先给它的窗口发"关闭"，等一会儿；还活着的进程强制结束。返回给模型看的结果。"""
+    if group.protected:
+        return ToolResult.error(f"{group.label}是系统程序，不能强制退出")
+    for w in _win32.list_windows():
+        if w.process.lower() == group.process.lower() and (w.shown or w.tucked):
+            _win32.close_window(w.hwnd)
+    _gone, alive = psutil.wait_procs(group.procs, timeout=QUIT_GRACE)
+    denied = 0
+    for p in alive:
+        try:
+            p.terminate()                  # Windows 上就是 TerminateProcess：强制结束
+        except psutil.NoSuchProcess:
+            pass
+        except psutil.AccessDenied:
+            denied += 1
+    _gone, alive = psutil.wait_procs(alive, timeout=3)
+    if alive:
+        hint = "，它可能是以管理员身份运行的" if denied else ""
+        return ToolResult.error(f"{group.label}还有 {len(alive)} 个进程没能结束{hint}")
+    return f"已彻底退出{group.label}"
 
 
 # ── 工具 ──────────────────────────────────────────────────
@@ -389,39 +478,86 @@ class SwitchToAppTool(Tool):
         return f"已切换到 {app.label}"
 
 
+def _close_plan(name: str) -> tuple[str, object]:
+    """"关掉 X"具体要做什么：("windows", 有窗口的程序) / ("quit", 只在后台的程序) /
+    ("protected", 系统程序) / ("none", 没在运行)。确认前和执行时各算一次。"""
+    app, _ = find_running(name)
+    if app is not None and app.shown:
+        return "windows", app
+    group, _ = find_process(name)
+    if group is None:
+        return "none", None
+    return ("protected" if group.protected else "quit"), group
+
+
 class CloseAppTool(Tool):
     name = "close_app"
     description = (
-        "关闭一个软件的所有窗口，效果等于点窗口右上角的 ×（软件有没保存的内容会自己弹窗问）。"
-        "不会强制结束进程：有些软件关掉窗口后还在托盘里运行，工具会如实返回，照实告诉用户。"
+        "关闭软件。有打开的窗口就关窗口，效果等于点右上角的 ×（没保存的内容软件会自己弹窗问）；"
+        "如果它只在托盘或后台运行、没有窗口，会在用户确认后彻底退出它。"
+        "关完窗口后它还留在托盘里的，工具会如实返回；用户要求彻底退出时用 quit_app。"
     )
     parameters = {
         "type": "object",
         "properties": {
-            "name": {"type": "string", "description": "软件名或窗口标题里的字，如 微信、记事本"},
+            "name": {"type": "string", "description": "软件名或窗口标题里的字，如 微信、记事本、豆包"},
         },
         "required": ["name"],
     }
+
     def requires_confirm(self, args: dict) -> bool:
-        # 只有真有窗口要关时才问；没在运行、或者只在托盘里，什么都不会发生，不用问
-        app, _ = find_running(args.get("name", ""))
-        return app is not None and bool(app.shown)
+        # 真要关窗口或结束进程时才问；没在运行、系统程序，什么都不会发生，不用问
+        kind, _ = _close_plan(args.get("name", ""))
+        return kind in ("windows", "quit")
 
     def confirm_prompt(self, args: dict) -> str:
+        kind, target = _close_plan(args.get("name", ""))
+        if kind == "quit":
+            return f"{target.label}在后台运行，要彻底退出它吗？"
         return f"确定要关闭{args.get('name', '这个软件')}吗？"
 
     async def execute(self, name: str) -> str:
-        app, candidates = find_running(name)
-        if app is None:
-            hint = f"差不多的有：{'、'.join(c.label for c in candidates)}。" if candidates else ""
-            return f"「{name}」没有在运行，不用关。{hint}"
-        if not app.shown:
-            return (f"{app.label}没有打开的窗口，它在后台运行（托盘图标或悬浮窗）。"
-                    "关窗口我能做，让它完全退出我做不到：要退出得在它的托盘图标上右键选退出。")
+        kind, target = _close_plan(name)
+        if kind == "none":
+            return f"「{name}」没有在运行，不用关。"
+        if kind == "protected":
+            return ToolResult.error(f"{target.label}是系统程序，不能关")
+        if kind == "quit":
+            return await asyncio.to_thread(quit_group, target)
+
+        app = target
         failures = [err for w in app.shown if (err := _win32.close_window(w.hwnd))]
         if failures:
             return ToolResult.error(failures[0])
         await asyncio.sleep(1.0)                   # 给它一点时间退出，再看进程还在不在
         if _process_alive(app.process):
-            return f"已关闭{app.label}的窗口，不过它还在后台运行（比如托盘里），要完全退出得在托盘图标上选退出"
+            return (f"已关闭{app.label}的窗口，不过它还在后台运行（比如托盘里）。"
+                    f"要连后台一起关，可以说“彻底退出{app.label}”")
         return f"已关闭{app.label}"
+
+
+class QuitAppTool(Tool):
+    name = "quit_app"
+    description = (
+        "彻底退出一个软件：连托盘和后台进程一起结束（先请它自己关，不行就强制结束，没保存的内容会丢）。"
+        "只在用户说“彻底退出”“后台也关掉”“完全关掉”时用；普通的“关掉”用 close_app。"
+        "系统程序（资源管理器、杀毒软件等）不能退出。"
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "name": {"type": "string", "description": "软件名，如 豆包、微信、QQ音乐"},
+        },
+        "required": ["name"],
+    }
+    needs_confirm = True
+
+    def confirm_prompt(self, args: dict) -> str:
+        return f"确定要彻底退出{args.get('name', '这个软件')}吗？没保存的内容会丢。"
+
+    async def execute(self, name: str) -> str:
+        group, candidates = find_process(name)
+        if group is None:
+            hint = f"差不多的有：{'、'.join(c.label for c in candidates)}。" if candidates else ""
+            return f"「{name}」没有在运行，不用退出。{hint}"
+        return await asyncio.to_thread(quit_group, group)
