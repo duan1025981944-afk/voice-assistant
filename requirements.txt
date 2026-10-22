@@ -18,8 +18,8 @@ screen-brightness-control
 psutil
 rapidfuzz
 
-# 托盘
-pystray
+# 托盘和菜单（tkinter 是 Python 自带的）
+pywin32               # Shell_NotifyIcon 放托盘图标、创建快捷方式
 Pillow
 
 # 测试

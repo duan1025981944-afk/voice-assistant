@@ -38,7 +38,7 @@ def setup_logging(console: bool) -> None:
         level=logging.INFO, handlers=handlers,
         format="%(asctime)s %(levelname)-7s %(name)s: %(message)s", datefmt="%H:%M:%S",
     )
-    for noisy in ("httpx", "openai", "comtypes", "asyncio"):
+    for noisy in ("httpx", "httpx2", "openai", "comtypes", "asyncio"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
 

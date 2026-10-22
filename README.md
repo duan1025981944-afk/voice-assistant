@@ -29,24 +29,38 @@ uv pip install --python .venv\Scripts\python.exe -r requirements.txt
 
 API key 和 mini_nanobot 用的是同一个环境变量 `DEEPSEEK_API_KEY`，已经设过就不用再设。
 
-开机自启（只在你的"启动"文件夹里放一个快捷方式，不需要管理员权限）：
+快捷方式（图标用 `assets/icon.ico`，不需要管理员权限）：
 
 ```powershell
-.venv\Scripts\python scripts\install_autostart.py           # 装
-.venv\Scripts\python scripts\install_autostart.py --remove  # 卸
+.venv\Scripts\python scripts\install_autostart.py                     # 开机自启（放进"启动"文件夹）
+.venv\Scripts\python scripts\install_autostart.py --desktop           # 桌面快捷方式，双击启动
+.venv\Scripts\python scripts\install_autostart.py --remove            # 删掉开机自启
+.venv\Scripts\python scripts\install_autostart.py --desktop --remove  # 删掉桌面快捷方式
 ```
+
+注意要用 `.venv\Scripts\python` 来运行脚本：直接输入 `scripts\xxx.py` 会被 Windows 交给关联的编辑器打开。
+
+换图标：把图片放进 `assets/`，运行 `.venv\Scripts\python scripts\make_icon.py 图片路径`（白底会自动抠掉），
+再重新运行上面创建快捷方式的命令。
 
 ## 托盘图标
 
-| 颜色 | 状态 |
-| --- | --- |
-| 灰 | 待命，等唤醒词 |
-| 绿 | 在听 |
-| 蓝 | 在想 |
-| 橙 | 在说 |
-| 红（带斜线） | 已暂停：麦克风流整个关掉，唤醒词也听不到 |
+托盘里是她的头像，右下角的小圆点表示状态：
 
-左键点一下 = 暂停 / 恢复。右键菜单可以打开日志文件夹、退出。
+| 样子 | 状态 |
+| --- | --- |
+| 只有头像 | 待命，等唤醒词 |
+| 绿点 | 在听 |
+| 蓝点 | 在想 |
+| 橙点 | 在说 |
+| 头像变灰 + 红点 | 已暂停：麦克风流整个关掉，唤醒词也听不到 |
+
+左键、右键点一下都会弹出菜单：暂停 / 恢复监听、打开日志文件夹、退出，以及唤醒词、快捷键、今天对话了几次。
+点菜单外面或按 Esc 关掉。
+
+新图标默认会被 Windows 收进托盘的 `^` 里。想让它一直露在外面，把它从 `^` 里拖到任务栏上就行。
+
+头像来自 `assets/icon.png`（`scripts/make_icon.py` 生成），裁脸的位置在 `ui/icons.py` 的 `HEAD_TOP` / `HEAD_SIZE`。
 
 ## 它能做的事（第一版）
 
@@ -107,7 +121,9 @@ assistant.py         编排层：状态机 待命 → 在听 → 在想 → 在�
 voice/               耳朵和嘴：mic / wake / listen（VAD + SenseVoice）/ tts / hotkey
 agent/               大脑：runner（精简的工具循环）、brain（组装）、tools/（桌面工具）
 providers/  config/  从 mini_nanobot 拷来的模型接入和配置读取
-ui/tray.py           托盘图标
+ui/tray.py           托盘图标和圆角菜单（Shell_NotifyIcon + tkinter）
+ui/icons.py          头像裁剪、各状态的托盘图标
+assets/              快捷方式图标（avatar.jpg → make_icon.py → icon.ico）
 templates/SOUL.md    系统提示，改了就生效
 data/                日志（logs/）和每轮耗时记录（events/），不进 git
 models/              语音模型，不进 git
